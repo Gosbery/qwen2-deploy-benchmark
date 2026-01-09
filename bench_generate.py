@@ -1,5 +1,4 @@
 import argparse
-import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
@@ -8,7 +7,6 @@ import requests
 
 
 def pct(values, p: float):
-    """percentile with linear interpolation (p in [0,100])"""
     if not values:
         return None
     xs = sorted(values)
@@ -22,22 +20,28 @@ def pct(values, p: float):
     return xs[f] + (xs[c] - xs[f]) * (k - f)
 
 
-def worker(session: requests.Session, url: str, payload: dict, timeout_s: float):
-    t0 = time.perf_counter()
-    try:
-        r = session.post(url, json=payload, timeout=timeout_s)
-        latency = time.perf_counter() - t0
-        status = r.status_code
-        if status != 200:
-            return {"ok": False, "status": status, "latency": latency, "err": r.text[:200]}
-        data = r.json()
-        # service may return {"error":"OOM", ...}
-        if isinstance(data, dict) and data.get("error"):
-            return {"ok": False, "status": status, "latency": latency, "err": f"{data.get('error')}: {str(data)[:200]}"}
-        return {"ok": True, "status": status, "latency": latency, "data": data}
-    except Exception as e:
-        latency = time.perf_counter() - t0
-        return {"ok": False, "status": "EXC", "latency": latency, "err": str(e)[:200]}
+def worker(url: str, payload: dict, timeout_s: float):
+    # IMPORTANT: one Session per thread -> thread-safe usage pattern
+    with requests.Session() as sess:
+        t0 = time.perf_counter()
+        try:
+            r = sess.post(url, json=payload, timeout=timeout_s)
+            latency = time.perf_counter() - t0
+            status = r.status_code
+
+            if status != 200:
+                return {"ok": False, "status": status, "latency": latency, "err": r.text[:200]}
+
+            data = r.json()
+            # server may return {"error":"OOM", ...}
+            if isinstance(data, dict) and data.get("error"):
+                return {"ok": False, "status": status, "latency": latency, "err": f"{data.get('error')}: {str(data)[:200]}"}
+
+            return {"ok": True, "status": status, "latency": latency, "data": data}
+
+        except Exception as e:
+            latency = time.perf_counter() - t0
+            return {"ok": False, "status": "EXC", "latency": latency, "err": str(e)[:200]}
 
 
 def main():
@@ -57,34 +61,31 @@ def main():
         "max_new_tokens": args.max_new_tokens,
     }
 
-    # Run
     t_start = time.perf_counter()
     results = []
     statuses = Counter()
 
-    with requests.Session() as sess:
-        with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
-            futures = [
-                ex.submit(worker, sess, args.url, payload, args.timeout)
-                for _ in range(args.requests)
-            ]
-            for fut in as_completed(futures):
-                res = fut.result()
-                results.append(res)
-                statuses[str(res["status"])] += 1
+    with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+        futures = [
+            ex.submit(worker, args.url, payload, args.timeout)
+            for _ in range(args.requests)
+        ]
+        for fut in as_completed(futures):
+            res = fut.result()
+            results.append(res)
+            statuses[str(res["status"])] += 1
 
     total_s = time.perf_counter() - t_start
     oks = [r for r in results if r["ok"]]
     fails = [r for r in results if not r["ok"]]
     lat_ok = [r["latency"] for r in oks]
 
-    # Throughput: completed requests per second
     rps = (len(results) / total_s) if total_s > 0 else 0.0
 
-    # Optional: tokens/s approx if server returns tokens_per_sec; otherwise skip
     tps_list = []
     vram_alloc = []
     vram_resv = []
+
     for r in oks:
         d = r.get("data") or {}
         if isinstance(d, dict):
@@ -94,11 +95,16 @@ def main():
                 except:
                     pass
             if "peak_vram_alloc_gb" in d:
-                vram_alloc.append(float(d["peak_vram_alloc_gb"]))
+                try:
+                    vram_alloc.append(float(d["peak_vram_alloc_gb"]))
+                except:
+                    pass
             if "peak_vram_reserved_gb" in d:
-                vram_resv.append(float(d["peak_vram_reserved_gb"]))
+                try:
+                    vram_resv.append(float(d["peak_vram_reserved_gb"]))
+                except:
+                    pass
 
-    # Print report (log-friendly)
     print("=== BENCH: /generate (non-stream) ===")
     print(f"url              : {args.url}")
     print(f"concurrency      : {args.concurrency}")
@@ -112,6 +118,7 @@ def main():
     print(f"success_rate     : {100.0 * len(oks) / max(1, len(results)):.2f}%")
     print(f"total_time_s     : {total_s:.4f}")
     print(f"req_per_sec      : {rps:.2f}")
+
     if lat_ok:
         print("=== LATENCY (success only) ===")
         print(f"avg_s            : {sum(lat_ok)/len(lat_ok):.4f}")
@@ -121,26 +128,26 @@ def main():
         print(f"p99_s            : {pct(lat_ok, 99):.4f}")
         print(f"min_s            : {min(lat_ok):.4f}")
         print(f"max_s            : {max(lat_ok):.4f}")
+
     if tps_list:
         print("=== TOKENS/SEC (from server, if provided) ===")
         print(f"avg_tokens_s     : {sum(tps_list)/len(tps_list):.2f}")
         print(f"min_tokens_s     : {min(tps_list):.2f}")
         print(f"max_tokens_s     : {max(tps_list):.2f}")
-    if vram_alloc or vram_resv:
-        if vram_alloc:
-            print(f"peak_alloc_gb    : {max(vram_alloc):.2f}")
-        if vram_resv:
-            print(f"peak_reserved_gb : {max(vram_resv):.2f}")
+
+    if vram_alloc:
+        print(f"peak_alloc_gb    : {max(vram_alloc):.2f}")
+    if vram_resv:
+        print(f"peak_reserved_gb : {max(vram_resv):.2f}")
+
     print("=== STATUS CODES ===")
     for k, v in statuses.most_common():
         print(f"{k:>6} : {v}")
 
     if fails:
-        # Show a few errors for diagnosis
         print("=== SAMPLE FAILURES (up to 5) ===")
         for r in fails[:5]:
             print(f"- status={r['status']} latency_s={r['latency']:.3f} err={r.get('err','')}")
-
 
 if __name__ == "__main__":
     main()
