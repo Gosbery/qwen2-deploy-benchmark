@@ -1,0 +1,87 @@
+Model: Qwen2-1.5B
+
+Backend: Transformers + FastAPI + Uvicorn
+
+Quantization: bitsandbytes INT8 (bnb-int8)
+
+Context / max_new_tokens / concurrency: ctx_default=2048, ctx_max=3072, max_new_tokens_default=64, max_new_tokens_max=256, concurrency_limit=1
+
+Peak VRAM: (N/A for /health; run benchmark to capture)
+
+TTFT / tokens per second: (N/A for /health; run benchmark to capture)
+
+OOM: No (service is up; benchmark will validate under load)
+
+当前结论：INT8 服务启动成功，/health 返回 200，dtype=int8，quantization=bnb-int8
+
+
+Model: Qwen2-1.5B-Instruct
+
+Backend: Transformers + bitsandbytes + FastAPI (/generate, non-stream)
+
+Quantization: INT8 (bnb-int8)
+
+Context / max_new_tokens / concurrency: ctx_len=2048, max_new_tokens=64, concurrency=5, total_requests=15, timeout=120s
+
+Peak VRAM: alloc=1.69 GB, reserved=1.73 GB
+
+TTFT / tokens per second: TTFT=N/A（此 bench 统计的是端到端延迟与服务端 tokens/sec 字段）；avg_tokens_s=2.05（min=1.93, max=2.10）
+
+OOM: No
+
+当前结论：
+
+显存明显下降（INT8 alloc~1.69GB），但 吞吐显著下降（avg_tokens_s~2.05），导致并发下端到端延迟严重恶化（avg~78s，p95~101s）。
+
+服务稳定性良好（15/15 成功，无 429/500）。
+
+Model: Qwen2-1.5B-Instruct
+
+Backend: Transformers + bitsandbytes + FastAPI (/generate, non-stream)
+
+Quantization: INT8 (bnb-int8)
+
+Context / max_new_tokens / concurrency: ctx_len=2048, max_new_tokens=64, concurrency=1, total_requests=10, timeout=120s
+
+Peak VRAM: alloc=1.69 GB, reserved=1.73 GB
+
+TTFT / tokens per second: TTFT=N/A（本 bench 不测 TTFT）；avg_tokens_s=2.10（min=2.07, max=2.12）
+
+OOM: No
+
+当前结论：
+
+INT8 在本机栈上 单请求吞吐稳定约 2.1 tokens/s，显著慢于 FP16（你之前 FP16 在服务端约 8.x tokens/s）。
+
+并发从 1 提升到 5 时，tokens/s 仍在 ~2 附近，说明 瓶颈是每请求生成速度（GPU/内核/实现）而非排队。
+
+INT8 的价值主要体现在 显存占用大幅下降（alloc~1.69GB），适合作为“显存兜底/更大 ctx_len 或更大 batch 的空间”，但不适合追求速度的在线默认配置。
+
+
+Model: Qwen2-1.5B
+
+Backend: HuggingFace Transformers + FastAPI (local)
+
+Quantization: INT4 (bitsandbytes NF4)
+
+Context / max_new_tokens / concurrency: 2048 / 64 / 1
+
+Peak VRAM: alloc 1.11 GB, reserved 1.48 GB
+
+TTFT / tokens per second: 0.5189 s / 6.81 tok/s
+
+OOM: No
+
+当前结论：
+
+INT4 服务端单次请求可用；在 ctx_len=2048 下显存占用显著低于 FP16（alloc≈1.11GB, reserved≈1.48GB）。
+
+本次实际生成 new_tokens=26（小于 max_new_tokens=64），说明生成提前遇到停止条件/结束符或采样使输出提前结束，因此 tokens/sec 与 total 时长只代表“这次回答的长度”，不能当成稳定吞吐基线。
+
+INT4 在 RTX 2060 6GB 上稳定可用：10/10 成功，无连接错误、无 OOM。
+
+单请求端到端延迟（含排队、prefill、decode、序列化）稳定在 avg 4.41s，尾延迟 p95 7.65s / p99 7.88s。
+
+吞吐（来自服务端返回 tokens/sec 的聚合）稳定在 ~6.5–6.8 tok/s，波动很小，说明“单并发”情况下 decode 速率较稳定。
+
+峰值显存极低（alloc 1.11GB / reserved 1.48GB），INT4 显存余量充足，后续可以把压力转移到 ctx_len/max_new_tokens/并发策略 的稳定性验证。
